@@ -19,6 +19,18 @@ export interface Party {
   items: AuditItem[];
 }
 
+export interface Lien {
+  id: string;
+  propertyId: string;
+  registrationNumber: string; // e.g., R-04/14.230
+  relatedMatricula?: string; // Specific matricula number if different or explicit
+  type: string; // Hipoteca, Penhora, Usufruto
+  description: string;
+  creditor: string;
+  value: number;
+  isActive: boolean; // True = Gravame Ativo, False = Baixado
+}
+
 export interface PropertyData {
   id: string;
   name: string;
@@ -32,6 +44,7 @@ export interface PropertyData {
 export interface AuditState {
   properties: PropertyData[];
   parties: Party[];
+  liens: Lien[]; // Global list of liens linked by propertyId
   generalNotes: string;
 }
 

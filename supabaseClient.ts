@@ -1,15 +1,12 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+// Credentials provided by the user
+const supabaseUrl = process.env.SUPABASE_URL || 'https://wbwpmorgrrcgfjmimuyv.supabase.co';
+const supabaseKey = process.env.SUPABASE_KEY || 'sb_publishable_Mhrdwuy3wercfJO8BwMFRQ_EEVPELP5';
 
-// Provide fallback values to prevent "supabaseUrl is required" error during initialization
-// if environment variables are not set. Database operations will fail gracefully.
-export const supabase = createClient(
-  supabaseUrl || 'https://placeholder.supabase.co',
-  supabaseKey || 'placeholder'
-);
+// Initialize Supabase Client
+export const supabase = createClient(supabaseUrl, supabaseKey);
 
 if (!supabaseUrl || !supabaseKey) {
-  console.warn("Supabase URL or Key missing. Database features will not work.");
+  console.warn("Supabase credentials missing. Database features might not work as expected.");
 }

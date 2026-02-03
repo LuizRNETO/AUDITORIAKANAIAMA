@@ -19,9 +19,19 @@ import {
   ChevronUpIcon,
   PencilSquareIcon,
   Squares2X2Icon,
-  ArrowPathIcon
+  ArrowPathIcon,
+  BanknotesIcon,
+  ScaleIcon,
+  ShieldCheckIcon,
+  ArchiveBoxXMarkIcon,
+  FunnelIcon,
+  NoSymbolIcon,
+  BarsArrowDownIcon,
+  BarsArrowUpIcon,
+  DocumentArrowDownIcon
 } from '@heroicons/react/24/outline';
-import { AuditState, AuditItem, Party, AnalysisResult, PropertyData } from './types';
+import { jsPDF } from 'jspdf';
+import { AuditState, AuditItem, Party, AnalysisResult, PropertyData, Lien } from './types';
 import { PROPERTY_CHECKLIST_TEMPLATE, PARTY_PF_CHECKLIST_TEMPLATE, PARTY_PJ_CHECKLIST_TEMPLATE } from './data/defaults';
 import { analyzeAuditRisks } from './services/geminiService';
 import { StatusSelector, StatusBadge, StatusDot, STATUS_CONFIG } from './components/StatusBadge';
@@ -45,6 +55,9 @@ const AuditRow: React.FC<AuditRowProps> = ({ item, onUpdate, onDelete }) => {
             <div>
                 <h4 className="text-sm font-semibold text-slate-900 group-hover:text-indigo-700 transition-colors">{item.name}</h4>
                 <p className="text-xs text-slate-500 mt-0.5 leading-relaxed">{item.description}</p>
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                    Atualizado em: {new Date(item.updatedAt).toLocaleDateString()} às {new Date(item.updatedAt).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                </span>
             </div>
         </div>
       </div>
@@ -160,16 +173,18 @@ interface Notification {
 }
 
 type DeleteTarget = {
-    type: 'item' | 'party' | 'property';
+    type: 'item' | 'party' | 'property' | 'lien';
     id: string;
     parentId?: string; // used for items (parent is property or party)
     parentType?: 'property' | 'party'; // used to distinguish where the item belongs
 };
 
+const LOCAL_STORAGE_KEY = 'rural_audit_backup';
+
 // --- Main App Component ---
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'property' | 'parties' | 'analysis'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'property' | 'liens' | 'parties' | 'analysis'>('dashboard');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
@@ -186,12 +201,25 @@ export default function App() {
   const [showAddItemModal, setShowAddItemModal] = useState(false);
   const [newItem, setNewItem] = useState({ category: 'Outros', name: '', description: '' });
 
+  // Modal State for New Lien
+  const [showAddLienModal, setShowAddLienModal] = useState(false);
+  const [newLien, setNewLien] = useState<Partial<Lien>>({
+    type: 'Hipoteca',
+    registrationNumber: '',
+    relatedMatricula: '',
+    creditor: '',
+    value: 0,
+    description: '',
+    isActive: true
+  });
+
   // Modal State for Delete Confirmation
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
   const [state, setState] = useState<AuditState>({
     properties: [],
     parties: [],
+    liens: [],
     generalNotes: ''
   });
 
@@ -201,12 +229,35 @@ export default function App() {
     loadData();
   }, []);
 
+  // Persistence Effect: Save to LocalStorage whenever state changes
+  useEffect(() => {
+    if (!isLoading && (state.properties.length > 0 || state.parties.length > 0)) {
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
+    }
+  }, [state, isLoading]);
+
   const loadData = async () => {
     setIsLoading(true);
     try {
-      const data = await auditService.fetchAuditState();
+      // 1. Try to fetch from API
+      let data = await auditService.fetchAuditState();
+      let usingLocal = false;
+
+      // 2. If API returns empty (likely network error or empty DB), try LocalStorage
+      if (data.properties.length === 0 && data.parties.length === 0) {
+        const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
+        if (cached) {
+            try {
+                data = JSON.parse(cached);
+                usingLocal = true;
+                console.log("Loaded from local cache");
+            } catch (e) {
+                console.error("Error parsing local cache", e);
+            }
+        }
+      }
       
-      // If no properties exist (first load), create a default one
+      // 3. If still empty (first use ever), create Defaults
       if (data.properties.length === 0 && data.parties.length === 0) {
         const defaultProp: PropertyData = {
           id: '', // Service will handle ID creation, or local fallback will
@@ -223,6 +274,7 @@ export default function App() {
           setState({
             properties: [createdProp],
             parties: [],
+            liens: [],
             generalNotes: ''
           });
           setActivePropertyId(createdProp.id);
@@ -232,15 +284,21 @@ export default function App() {
           setState({
             properties: [defaultProp],
             parties: [],
+            liens: [],
             generalNotes: ''
           });
           setActivePropertyId(defaultProp.id);
-          addNotification("Modo Offline: Dados salvos apenas localmente.", "warning");
         }
       } else {
         setState(data);
         if (data.properties.length > 0) {
-          setActivePropertyId(data.properties[0].id);
+          // If active ID is not valid, set to first property
+          if (!activePropertyId || !data.properties.find(p => p.id === activePropertyId)) {
+             setActivePropertyId(data.properties[0].id);
+          }
+        }
+        if (usingLocal) {
+            addNotification("Modo Offline: Dados recuperados do cache local.", "warning");
         }
       }
     } catch (error) {
@@ -276,6 +334,9 @@ export default function App() {
   // --- Handlers with Persistence ---
 
   const handlePropertyItemUpdate = (propertyId: string, itemId: string, updates: Partial<AuditItem>) => {
+    // Add timestamp to updates for correct sorting
+    const updatesWithTime = { ...updates, updatedAt: new Date().toISOString() };
+
     // Optimistic Update
     setState(prev => ({
       ...prev,
@@ -283,13 +344,13 @@ export default function App() {
         if (prop.id !== propertyId) return prop;
         return {
           ...prop,
-          items: prop.items.map(item => item.id === itemId ? { ...item, ...updates } : item)
+          items: prop.items.map(item => item.id === itemId ? { ...item, ...updatesWithTime } : item)
         };
       })
     }));
 
-    // Persist
-    auditService.updateAuditItem(itemId, updates);
+    // Persist to DB (Fire and forget, localStorage will catch state change)
+    auditService.updateAuditItem(itemId, updatesWithTime);
 
     // Notifications
     if (updates.status) {
@@ -381,6 +442,63 @@ export default function App() {
     setNewItem({ category: 'Outros', name: '', description: '' });
   };
 
+  // --- Lien Handlers ---
+  const handleAddLien = async () => {
+    if (!activePropertyId) {
+      addNotification('Selecione um imóvel antes de adicionar um ônus.', 'warning');
+      return;
+    }
+    const lienData: Lien = {
+      id: '',
+      propertyId: activePropertyId,
+      registrationNumber: newLien.registrationNumber || '',
+      relatedMatricula: newLien.relatedMatricula || '',
+      type: newLien.type || 'Outros',
+      description: newLien.description || '',
+      creditor: newLien.creditor || '',
+      value: Number(newLien.value) || 0,
+      isActive: newLien.isActive !== undefined ? newLien.isActive : true
+    };
+
+    try {
+      const createdLien = await auditService.createLien(lienData);
+      setState(prev => ({
+        ...prev,
+        liens: [...prev.liens, createdLien]
+      }));
+      addNotification('Ônus adicionado com sucesso.', 'info');
+    } catch (e) {
+      lienData.id = 'loc-lien-' + Math.random().toString(36).substr(2, 9);
+      setState(prev => ({
+        ...prev,
+        liens: [...prev.liens, lienData]
+      }));
+      addNotification('Ônus adicionado (Localmente).', 'warning');
+    }
+    setShowAddLienModal(false);
+    // Reset form but keep matricula context if needed, or clear it. Let's clear.
+    setNewLien({ type: 'Hipoteca', isActive: true, value: 0, relatedMatricula: '', registrationNumber: '', description: '', creditor: '' });
+  };
+
+  const updateLienDetails = (lienId: string, updates: Partial<Lien>) => {
+    setState(prev => ({
+      ...prev,
+      liens: prev.liens.map(l => l.id === lienId ? { ...l, ...updates } : l)
+    }));
+    auditService.updateLien(lienId, updates);
+  };
+
+  const toggleLienStatus = async (lienId: string, currentStatus: boolean) => {
+    const newStatus = !currentStatus;
+    setState(prev => ({
+      ...prev,
+      liens: prev.liens.map(l => l.id === lienId ? { ...l, isActive: newStatus } : l)
+    }));
+    await auditService.updateLien(lienId, { isActive: newStatus });
+  };
+
+  // --- Party Handlers ---
+
   const handlePartyItemUpdate = (partyId: string, itemId: string, updates: Partial<AuditItem>) => {
     // Optimistic
     setState(prev => ({
@@ -421,7 +539,7 @@ export default function App() {
 
   // --- DELETION LOGIC ---
 
-  const handleDeleteRequest = (type: 'item' | 'party' | 'property', id: string, parentId?: string, parentType?: 'property' | 'party') => {
+  const handleDeleteRequest = (type: 'item' | 'party' | 'property' | 'lien', id: string, parentId?: string, parentType?: 'property' | 'party') => {
     setDeleteTarget({ type, id, parentId, parentType });
   };
 
@@ -444,7 +562,7 @@ export default function App() {
           }
           await auditService.deleteProperty(id);
           const newProperties = state.properties.filter(p => p.id !== id);
-          setState(prev => ({ ...prev, properties: newProperties }));
+          setState(prev => ({ ...prev, properties: newProperties, liens: prev.liens.filter(l => l.propertyId !== id) }));
           if (activePropertyId === id) {
               setActivePropertyId(newProperties[0].id);
           }
@@ -477,31 +595,26 @@ export default function App() {
           }
           addNotification("Item removido.", "info");
       }
+      else if (type === 'lien') {
+        await auditService.deleteLien(id);
+        setState(prev => ({
+          ...prev,
+          liens: prev.liens.filter(l => l.id !== id)
+        }));
+        addNotification("Ônus removido.", "info");
+      }
     } catch (e) {
-      // Local fallback for deletion isn't strictly necessary for visual feedback as we usually rely on optimism,
-      // but here we already updated state above if we moved state update out of try/catch?
-      // Actually, I put await inside the blocks.
-      // For robustness, let's just swallow the error if in offline mode, and assume memory deletion worked if we move state update out?
-      // No, let's keep it simple: If delete fails, we assume it failed for real, UNLESS we are in offline mode.
-      // But identifying offline mode here is tricky. 
-      // Simplified: Just update state regardless of backend success for better UX in mixed modes.
-      
-      // Since I cannot rewrite the entire block easily in this context without duplication, I'll rely on the optimistic updates I will apply now:
-      // I will move the setState calls OUTSIDE the try block or assume success for local objects.
-      
       console.warn("Delete op failed (offline?)", e);
       // Fallback: Force update UI
       if (type === 'party') {
          setState(prev => ({ ...prev, parties: prev.parties.filter(p => p.id !== id) }));
       } else if (type === 'property') {
-         // Logic repeated for fallback safety
           if (state.properties.length > 1) {
              const newProperties = state.properties.filter(p => p.id !== id);
              setState(prev => ({ ...prev, properties: newProperties }));
              if (activePropertyId === id) setActivePropertyId(newProperties[0].id);
           }
       } else if (type === 'item') {
-         // Logic repeated
          if (parentType === 'party' && parentId) {
               setState(prev => ({
                   ...prev,
@@ -519,6 +632,11 @@ export default function App() {
                   })
                }));
          }
+      } else if (type === 'lien') {
+        setState(prev => ({
+          ...prev,
+          liens: prev.liens.filter(l => l.id !== id)
+        }));
       }
       addNotification("Item removido (Localmente).", "info");
     }
@@ -573,6 +691,145 @@ export default function App() {
     }
   };
 
+  // --- PDF GENERATION LOGIC ---
+
+  const handleGeneratePDF = () => {
+    if (!analysisResult) return;
+
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 20;
+    const contentWidth = pageWidth - (margin * 2);
+    let y = 20;
+
+    // Helper to check page break
+    const checkPageBreak = (neededHeight: number) => {
+        if (y + neededHeight > pageHeight - margin) {
+            doc.addPage();
+            y = 20;
+            return true;
+        }
+        return false;
+    };
+
+    // --- Header ---
+    doc.setFontSize(18);
+    doc.setTextColor(30, 41, 59); // Slate-800
+    doc.text("Relatório de Auditoria Rural", margin, y);
+    doc.setFontSize(10);
+    doc.setTextColor(100, 116, 139); // Slate-500
+    doc.text("Gerado por RuralAudit Pro", pageWidth - margin, y, { align: 'right' });
+    y += 8;
+    
+    doc.setDrawColor(203, 213, 225); // Slate-300
+    doc.line(margin, y, pageWidth - margin, y);
+    y += 10;
+
+    doc.setFontSize(10);
+    doc.text(`Data: ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()}`, margin, y);
+    y += 10;
+
+    // --- Risk Level ---
+    doc.setFontSize(14);
+    doc.setFont("helvetica", "bold");
+    doc.text("Nível de Risco Identificado:", margin, y);
+    y += 8;
+
+    let riskColor = [34, 197, 94]; // Green
+    if (analysisResult.riskLevel === 'Médio') riskColor = [234, 179, 8]; // Yellow
+    if (analysisResult.riskLevel === 'Alto') riskColor = [239, 68, 68]; // Red
+
+    doc.setFillColor(riskColor[0], riskColor[1], riskColor[2]);
+    doc.rect(margin, y, contentWidth, 12, 'F');
+    
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(12);
+    doc.text(analysisResult.riskLevel.toUpperCase(), margin + 5, y + 8);
+    y += 20;
+
+    // --- Executive Summary ---
+    doc.setTextColor(30, 41, 59);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.text("Resumo Executivo", margin, y);
+    y += 6;
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    const splitSummary = doc.splitTextToSize(analysisResult.summary, contentWidth);
+    
+    checkPageBreak(splitSummary.length * 5);
+    doc.text(splitSummary, margin, y);
+    y += (splitSummary.length * 5) + 10;
+
+    // --- Property Info & Active Liens ---
+    checkPageBreak(40);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.text("Imóveis e Ônus Reais Ativos", margin, y);
+    y += 6;
+
+    state.properties.forEach(prop => {
+        checkPageBreak(30);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10);
+        doc.text(`- ${prop.name} (Matrícula: ${prop.matricula})`, margin, y);
+        y += 5;
+
+        // Find active liens
+        const activeLiens = state.liens.filter(l => l.propertyId === prop.id && l.isActive);
+        
+        if (activeLiens.length > 0) {
+            activeLiens.forEach(l => {
+                checkPageBreak(15);
+                doc.setFont("helvetica", "normal");
+                doc.setTextColor(185, 28, 28); // Red text for liens
+                doc.text(`  [ÔNUS] ${l.type} (${l.registrationNumber}) - ${l.creditor} - R$ ${l.value.toLocaleString('pt-BR')}`, margin + 5, y);
+                y += 5;
+            });
+            doc.setTextColor(30, 41, 59); // Reset color
+        } else {
+             doc.setFont("helvetica", "italic");
+             doc.setTextColor(100, 116, 139);
+             doc.text("  Nenhum ônus ativo registrado na auditoria.", margin + 5, y);
+             doc.setTextColor(30, 41, 59);
+             doc.setFont("helvetica", "normal");
+             y += 5;
+        }
+        y += 5;
+    });
+    
+    // --- Recommendations ---
+    y += 5;
+    checkPageBreak(40);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.text("Recomendações Práticas", margin, y);
+    y += 6;
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    
+    analysisResult.recommendations.forEach(rec => {
+        const splitRec = doc.splitTextToSize(`• ${rec}`, contentWidth);
+        checkPageBreak(splitRec.length * 5);
+        doc.text(splitRec, margin, y);
+        y += (splitRec.length * 5) + 2;
+    });
+
+    // --- Footer ---
+    const pageCount = doc.internal.pages.length - 1; // jspdf starts with 1 page
+    for (let i = 1; i <= pageCount; i++) {
+        doc.setPage(i);
+        doc.setFontSize(8);
+        doc.setTextColor(150, 150, 150);
+        doc.text(`Página ${i} de ${pageCount} - Este relatório foi gerado por IA e não substitui consultoria jurídica.`, pageWidth / 2, pageHeight - 10, { align: 'center' });
+    }
+
+    doc.save(`auditoria_rural_${new Date().toISOString().split('T')[0]}.pdf`);
+  };
+
   // --- Top Header Component ---
   const TopHeader = () => {
     const unreadCount = notifications.filter(n => !n.read).length;
@@ -583,6 +840,7 @@ export default function App() {
            <div className="md:hidden flex gap-4">
              <button onClick={() => setActiveTab('dashboard')} className={activeTab === 'dashboard' ? 'text-indigo-600' : 'text-slate-600'}><ChartBarIcon className="w-6 h-6" /></button>
              <button onClick={() => setActiveTab('property')} className={activeTab === 'property' ? 'text-indigo-600' : 'text-slate-600'}><HomeModernIcon className="w-6 h-6" /></button>
+             <button onClick={() => setActiveTab('liens')} className={activeTab === 'liens' ? 'text-indigo-600' : 'text-slate-600'}><ScaleIcon className="w-6 h-6" /></button>
              <button onClick={() => setActiveTab('parties')} className={activeTab === 'parties' ? 'text-indigo-600' : 'text-slate-600'}><UsersIcon className="w-6 h-6" /></button>
            </div>
            <h1 className="hidden md:block font-bold text-slate-900 text-lg">
@@ -664,11 +922,53 @@ export default function App() {
     let propIssues = 0;
     let propPending = 0;
     let totalPropItems = 0;
+    
+    // Liens Logic
+    const activeLiensCount = state.liens.filter(l => l.isActive).length;
+    const totalDebt = state.liens.filter(l => l.isActive).reduce((acc, l) => acc + l.value, 0);
+
+    // Expired Items Collection
+    const expiredItems: { id: string; entity: string; type: 'Imóvel' | 'Parte'; name: string; date: string }[] = [];
+
+    // Detailed Stats Counters
+    let countOk = 0;
+    let countPendingDetailed = 0; // pending + waiting
+    let countIssue = 0;
+    let countExpired = 0;
+    let countWaived = 0;
+
+    const allItems: AuditItem[] = [];
+    state.properties.forEach(p => allItems.push(...p.items));
+    state.parties.forEach(p => allItems.push(...p.items));
+
+    allItems.forEach(item => {
+        if (item.status === 'ok') countOk++;
+        else if (item.status === 'pending' || item.status === 'waiting') countPendingDetailed++;
+        else if (item.status === 'issue') countIssue++;
+        else if (item.status === 'expired') countExpired++;
+        else if (item.status === 'waived') countWaived++;
+    });
+
+    const totalItemsCount = allItems.length;
+    const getPercent = (c: number) => totalItemsCount > 0 ? (c / totalItemsCount) * 100 : 0;
 
     state.properties.forEach(prop => {
         propIssues += prop.items.filter(i => i.status === 'issue' || i.status === 'expired').length;
         propPending += prop.items.filter(i => i.status === 'pending').length;
         totalPropItems += prop.items.length;
+        
+        // Collect Expired
+        prop.items.forEach(item => {
+            if (item.status === 'expired') {
+                expiredItems.push({
+                    id: item.id,
+                    entity: prop.name,
+                    type: 'Imóvel',
+                    name: item.name,
+                    date: new Date(item.updatedAt).toLocaleDateString()
+                });
+            }
+        });
     });
     
     let partyIssues = 0;
@@ -676,6 +976,19 @@ export default function App() {
     state.parties.forEach(p => {
       partyIssues += p.items.filter(i => i.status === 'issue' || i.status === 'expired').length;
       partyPending += p.items.filter(i => i.status === 'pending').length;
+      
+      // Collect Expired
+      p.items.forEach(item => {
+          if (item.status === 'expired') {
+              expiredItems.push({
+                  id: item.id,
+                  entity: p.name,
+                  type: 'Parte',
+                  name: item.name,
+                  date: new Date(item.updatedAt).toLocaleDateString()
+              });
+          }
+      });
     });
 
     const totalItems = totalPropItems + state.parties.reduce((acc, p) => acc + p.items.length, 0);
@@ -683,61 +996,179 @@ export default function App() {
     const progress = totalItems > 0 ? Math.round((totalDone / totalItems) * 100) : 0;
 
     return (
-      <div className="space-y-6">
+      <div className="space-y-8">
         {/* KPI Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-slate-400 flex flex-col justify-between h-32 hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start">
-               <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Total de Itens</h3>
-               <ClipboardDocumentCheckIcon className="w-6 h-6 text-slate-400" />
-            </div>
-            <div>
-               <span className="text-3xl font-bold text-slate-900">{totalItems}</span>
-               <span className="ml-2 text-sm text-slate-500">verificações</span>
-            </div>
+          
+          {/* Card 1: Total */}
+          <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100 relative overflow-hidden group hover:shadow-md transition-all duration-300">
+             <div className="absolute top-0 right-0 w-24 h-24 bg-slate-50 rounded-bl-full -mr-4 -mt-4 transition-transform group-hover:scale-110"></div>
+             <div className="relative flex flex-col h-full justify-between gap-4">
+                <div className="flex justify-between items-start">
+                   <div className="p-3 bg-slate-100 rounded-xl text-slate-600 group-hover:bg-slate-800 group-hover:text-white transition-colors shadow-sm">
+                      <ClipboardDocumentCheckIcon className="w-6 h-6" />
+                   </div>
+                </div>
+                <div>
+                   <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Total de Verificações</p>
+                   <div className="flex items-baseline gap-2 mt-1">
+                      <span className="text-3xl font-extrabold text-slate-900">{totalItems}</span>
+                      <span className="text-sm font-medium text-slate-500">itens</span>
+                   </div>
+                </div>
+             </div>
           </div>
 
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-amber-400 flex flex-col justify-between h-32 hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start">
-               <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Pendências</h3>
-               <ClockIcon className="w-6 h-6 text-amber-400" />
-            </div>
-            <div>
-               <span className="text-3xl font-bold text-amber-600">{propPending + partyPending}</span>
-               <span className="ml-2 text-sm text-slate-500">aguardando</span>
-            </div>
+          {/* Card 2: Pending */}
+          <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100 relative overflow-hidden group hover:shadow-md transition-all duration-300">
+             <div className="absolute top-0 right-0 w-24 h-24 bg-amber-50 rounded-bl-full -mr-4 -mt-4 transition-transform group-hover:scale-110"></div>
+             <div className="relative flex flex-col h-full justify-between gap-4">
+                <div className="flex justify-between items-start">
+                   <div className="p-3 bg-amber-100 rounded-xl text-amber-600 group-hover:bg-amber-500 group-hover:text-white transition-colors shadow-sm">
+                      <ClockIcon className="w-6 h-6" />
+                   </div>
+                </div>
+                <div>
+                   <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Pendências</p>
+                   <div className="flex items-baseline gap-2 mt-1">
+                      <span className="text-3xl font-extrabold text-amber-600">{propPending + partyPending}</span>
+                      <span className="text-sm font-medium text-slate-500">aguardando</span>
+                   </div>
+                </div>
+             </div>
           </div>
 
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-rose-500 flex flex-col justify-between h-32 hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start">
-               <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Risco Alto</h3>
-               <ExclamationTriangleIcon className="w-6 h-6 text-rose-500" />
+          {/* Card 3: Debt/Risk */}
+          {activeLiensCount > 0 ? (
+            <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100 relative overflow-hidden group hover:shadow-md transition-all duration-300">
+                <div className="absolute top-0 right-0 w-24 h-24 bg-red-50 rounded-bl-full -mr-4 -mt-4 transition-transform group-hover:scale-110"></div>
+                <div className="relative flex flex-col h-full justify-between gap-4">
+                    <div className="flex justify-between items-start">
+                        <div className="p-3 bg-red-100 rounded-xl text-red-600 group-hover:bg-red-600 group-hover:text-white transition-colors shadow-sm">
+                            <BanknotesIcon className="w-6 h-6" />
+                        </div>
+                    </div>
+                    <div>
+                        <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Ônus / Dívida Total</p>
+                        <div className="flex flex-col mt-1">
+                            <span className="text-2xl font-extrabold text-red-600 truncate" title={new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(totalDebt)}>
+                                {new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 }).format(totalDebt)}
+                            </span>
+                            <span className="text-xs font-medium text-red-400 mt-0.5">{activeLiensCount} gravames ativos</span>
+                        </div>
+                    </div>
+                </div>
             </div>
-            <div>
-               <span className="text-3xl font-bold text-rose-600">{propIssues + partyIssues}</span>
-               <span className="ml-2 text-sm text-slate-500">críticos</span>
+          ) : (
+            <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100 relative overflow-hidden group hover:shadow-md transition-all duration-300">
+                <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-50 rounded-bl-full -mr-4 -mt-4 transition-transform group-hover:scale-110"></div>
+                <div className="relative flex flex-col h-full justify-between gap-4">
+                    <div className="flex justify-between items-start">
+                        <div className="p-3 bg-emerald-100 rounded-xl text-emerald-600 group-hover:bg-emerald-600 group-hover:text-white transition-colors shadow-sm">
+                            <ShieldCheckIcon className="w-6 h-6" />
+                        </div>
+                    </div>
+                    <div>
+                        <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Pontos de Atenção</p>
+                        <div className="flex items-baseline gap-2 mt-1">
+                            <span className={`text-3xl font-extrabold ${propIssues + partyIssues > 0 ? 'text-rose-600' : 'text-emerald-600'}`}>{propIssues + partyIssues}</span>
+                            <span className="text-sm font-medium text-slate-500">críticos</span>
+                        </div>
+                    </div>
+                </div>
             </div>
-          </div>
+          )}
 
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-indigo-500 flex flex-col justify-between h-32 hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start">
-               <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Progresso</h3>
-               <ChartBarIcon className="w-6 h-6 text-indigo-500" />
-            </div>
-            <div className="w-full">
-               <div className="flex justify-between items-end mb-1">
-                   <span className="text-3xl font-bold text-indigo-600">{progress}%</span>
-                   <span className="text-sm text-slate-500">concluído</span>
-               </div>
-               <div className="w-full bg-slate-100 rounded-full h-2">
-                   <div className="bg-indigo-600 h-2 rounded-full transition-all duration-500" style={{ width: `${progress}%` }}></div>
-               </div>
-            </div>
+          {/* Card 4: Progress */}
+          <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-100 relative overflow-hidden group hover:shadow-md transition-all duration-300">
+             <div className="absolute top-0 right-0 w-24 h-24 bg-indigo-50 rounded-bl-full -mr-4 -mt-4 transition-transform group-hover:scale-110"></div>
+             <div className="relative flex flex-col h-full justify-between gap-4">
+                <div className="flex justify-between items-start">
+                   <div className="p-3 bg-indigo-100 rounded-xl text-indigo-600 group-hover:bg-indigo-600 group-hover:text-white transition-colors shadow-sm">
+                      <ChartBarIcon className="w-6 h-6" />
+                   </div>
+                   <span className="text-2xl font-bold text-indigo-600">{progress}%</span>
+                </div>
+                <div className="w-full">
+                   <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Conclusão</p>
+                   <div className="w-full bg-slate-100 rounded-full h-2">
+                       <div className="bg-indigo-600 h-2 rounded-full transition-all duration-1000 ease-out shadow-[0_0_10px_rgba(79,70,229,0.3)]" style={{ width: `${progress}%` }}></div>
+                   </div>
+                </div>
+             </div>
           </div>
         </div>
+        
+        {/* NEW: Visual Status Breakdown Section */}
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 animate-fade-in">
+            <h3 className="text-base font-bold text-slate-900 mb-4">Status da Auditoria</h3>
+            
+            {/* Multi-color Progress Bar */}
+            <div className="w-full h-4 bg-slate-100 rounded-full overflow-hidden flex mb-6">
+                <div style={{ width: `${getPercent(countOk)}%` }} className="bg-emerald-500 h-full transition-all duration-500" title="Regular"></div>
+                <div style={{ width: `${getPercent(countWaived)}%` }} className="bg-slate-400 h-full transition-all duration-500" title="Dispensado"></div>
+                <div style={{ width: `${getPercent(countPendingDetailed)}%` }} className="bg-amber-400 h-full transition-all duration-500" title="Pendente"></div>
+                <div style={{ width: `${getPercent(countExpired)}%` }} className="bg-orange-500 h-full transition-all duration-500" title="Vencido"></div>
+                <div style={{ width: `${getPercent(countIssue)}%` }} className="bg-rose-500 h-full transition-all duration-500" title="Irregularidade"></div>
+            </div>
 
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200">
-          <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 rounded-t-xl flex justify-between items-center">
+            {/* Legend / Stats Grid */}
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                <div className="flex flex-col items-center p-4 rounded-xl bg-emerald-50 border border-emerald-100 hover:bg-emerald-100 transition-colors">
+                    <CheckCircleIcon className="w-6 h-6 text-emerald-600 mb-2" />
+                    <span className="text-2xl font-bold text-emerald-700">{countOk}</span>
+                    <span className="text-xs text-emerald-600 font-bold uppercase tracking-wider">Regular</span>
+                </div>
+                <div className="flex flex-col items-center p-4 rounded-xl bg-slate-50 border border-slate-200 hover:bg-slate-100 transition-colors">
+                    <NoSymbolIcon className="w-6 h-6 text-slate-500 mb-2" />
+                    <span className="text-2xl font-bold text-slate-600">{countWaived}</span>
+                    <span className="text-xs text-slate-500 font-bold uppercase tracking-wider">Dispensado</span>
+                </div>
+                <div className="flex flex-col items-center p-4 rounded-xl bg-amber-50 border border-amber-100 hover:bg-amber-100 transition-colors">
+                    <ClockIcon className="w-6 h-6 text-amber-600 mb-2" />
+                    <span className="text-2xl font-bold text-amber-700">{countPendingDetailed}</span>
+                    <span className="text-xs text-amber-600 font-bold uppercase tracking-wider">Pendente</span>
+                </div>
+                <div className="flex flex-col items-center p-4 rounded-xl bg-orange-50 border border-orange-100 hover:bg-orange-100 transition-colors">
+                    <ArchiveBoxXMarkIcon className="w-6 h-6 text-orange-600 mb-2" />
+                    <span className="text-2xl font-bold text-orange-700">{countExpired}</span>
+                    <span className="text-xs text-orange-600 font-bold uppercase tracking-wider">Vencido</span>
+                </div>
+                <div className="flex flex-col items-center p-4 rounded-xl bg-rose-50 border border-rose-100 hover:bg-rose-100 transition-colors">
+                    <ExclamationTriangleIcon className="w-6 h-6 text-rose-600 mb-2" />
+                    <span className="text-2xl font-bold text-rose-700">{countIssue}</span>
+                    <span className="text-xs text-rose-600 font-bold uppercase tracking-wider">Risco</span>
+                </div>
+            </div>
+        </div>
+        
+        {/* Expired Items Section (New) */}
+        {expiredItems.length > 0 && (
+          <div className="bg-white rounded-xl shadow-sm border border-orange-200 overflow-hidden">
+             <div className="px-6 py-4 border-b border-orange-100 bg-orange-50 flex items-center gap-2">
+                <ArchiveBoxXMarkIcon className="w-5 h-5 text-orange-600" />
+                <h3 className="text-base font-bold text-orange-800">Alertas de Vencimento</h3>
+             </div>
+             <div className="divide-y divide-slate-100">
+               {expiredItems.map((item, idx) => (
+                 <div key={idx} className="p-4 flex items-center justify-between hover:bg-slate-50">
+                    <div className="flex flex-col">
+                      <span className="text-sm font-semibold text-slate-800">{item.name}</span>
+                      <span className="text-xs text-slate-500">
+                         {item.type}: {item.entity}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                       <span className="text-xs font-medium text-orange-600 bg-orange-100 px-2 py-1 rounded">Vencido</span>
+                    </div>
+                 </div>
+               ))}
+             </div>
+          </div>
+        )}
+
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200">
+          <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 rounded-t-2xl flex justify-between items-center">
             <h3 className="text-base font-semibold text-slate-900">Resumo dos Imóveis</h3>
             <span className="text-xs text-slate-500">{state.properties.length} imóveis cadastrados</span>
           </div>
@@ -779,17 +1210,45 @@ export default function App() {
 
   const PropertyView = () => {
     const activeProperty = state.properties.find(p => p.id === activePropertyId);
+    const [filterStatus, setFilterStatus] = useState<string>('all');
+    const [sortOption, setSortOption] = useState<string>('default');
 
     // Group items by category for the active property
     const groupedItems = useMemo<Record<string, AuditItem[]>>(() => {
         if (!activeProperty) return {};
+        
+        let items = [...activeProperty.items];
+
+        // 1. Filter by Status
+        if (filterStatus !== 'all') {
+            items = items.filter(i => i.status === filterStatus);
+        }
+
+        // 2. Sort Items
+        items.sort((a, b) => {
+            switch(sortOption) {
+                case 'name': 
+                    return a.name.localeCompare(b.name);
+                case 'status':
+                    // Priority: Issue -> Expired -> Pending -> Waiting -> OK -> Waived
+                    const priority: Record<string, number> = { issue: 0, expired: 1, pending: 2, waiting: 3, ok: 4, waived: 5 };
+                    return (priority[a.status] ?? 99) - (priority[b.status] ?? 99);
+                case 'date-desc':
+                    return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+                case 'date-asc':
+                    return new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime();
+                default: 
+                    return 0; // Default checklist order (by creation)
+            }
+        });
+
         const groups: Record<string, AuditItem[]> = {};
-        activeProperty.items.forEach(item => {
+        items.forEach(item => {
             if (!groups[item.category]) groups[item.category] = [];
             groups[item.category].push(item);
         });
         return groups;
-    }, [activeProperty]);
+    }, [activeProperty, filterStatus, sortOption]);
 
     if (!activeProperty && state.properties.length > 0) {
         // Fallback if deletion happens
@@ -895,6 +1354,37 @@ export default function App() {
                 </div>
             </div>
 
+            {/* Filters and Sorting */}
+            <div className="flex flex-col md:flex-row justify-end mb-4 items-center gap-3">
+                <div className="w-full md:w-auto flex items-center gap-2">
+                    <FunnelIcon className="w-4 h-4 text-slate-400" />
+                    <select
+                        value={filterStatus}
+                        onChange={(e) => setFilterStatus(e.target.value)}
+                        className="block w-full md:w-48 rounded-md border-slate-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm border p-2 bg-white text-slate-700"
+                    >
+                        <option value="all">Status: Todos</option>
+                        {Object.entries(STATUS_CONFIG).map(([key, config]) => (
+                            <option key={key} value={key}>{config.label}</option>
+                        ))}
+                    </select>
+                </div>
+                <div className="w-full md:w-auto flex items-center gap-2">
+                    {sortOption.includes('date-desc') || sortOption.includes('name') ? <BarsArrowDownIcon className="w-4 h-4 text-slate-400" /> : <BarsArrowUpIcon className="w-4 h-4 text-slate-400" />}
+                    <select
+                        value={sortOption}
+                        onChange={(e) => setSortOption(e.target.value)}
+                        className="block w-full md:w-48 rounded-md border-slate-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm border p-2 bg-white text-slate-700"
+                    >
+                        <option value="default">Padrão (Checklist)</option>
+                        <option value="name">Nome (A-Z)</option>
+                        <option value="status">Prioridade (Risco)</option>
+                        <option value="date-desc">Recentes primeiro</option>
+                        <option value="date-asc">Antigos primeiro</option>
+                    </select>
+                </div>
+            </div>
+
             {/* Checklist */}
             <div className="space-y-4">
                 {Object.entries(groupedItems).map(([category, items]) => (
@@ -909,6 +1399,12 @@ export default function App() {
                 {activeProperty.items.length === 0 && (
                     <div className="text-center py-12 bg-white rounded-xl border border-dashed border-slate-300">
                         <p className="text-slate-500">Nenhum item na lista para este imóvel.</p>
+                    </div>
+                )}
+                {Object.keys(groupedItems).length === 0 && activeProperty.items.length > 0 && (
+                    <div className="text-center py-12 bg-white rounded-xl border border-dashed border-slate-300">
+                        <p className="text-slate-500">Nenhum item encontrado com o status selecionado.</p>
+                        <button onClick={() => setFilterStatus('all')} className="text-indigo-600 hover:text-indigo-800 text-sm font-medium mt-2">Limpar filtro</button>
                     </div>
                 )}
             </div>
@@ -987,6 +1483,274 @@ export default function App() {
       )}
     </div>
   )};
+
+  const LiensView = () => {
+    // Filter liens for the active property
+    const propertyLiens = state.liens.filter(l => l.propertyId === activePropertyId);
+    
+    // Sort: Active first, then by registration number
+    propertyLiens.sort((a, b) => {
+      if (a.isActive && !b.isActive) return -1;
+      if (!a.isActive && b.isActive) return 1;
+      return a.registrationNumber.localeCompare(b.registrationNumber);
+    });
+
+    const activeProperty = state.properties.find(p => p.id === activePropertyId);
+
+    // Auto-fill matricula when opening modal for specific property if not set
+    useEffect(() => {
+        if (showAddLienModal && !newLien.relatedMatricula && activeProperty) {
+            setNewLien(prev => ({...prev, relatedMatricula: activeProperty.matricula}));
+        }
+    }, [showAddLienModal, activeProperty]);
+
+    if (state.properties.length === 0) return <div className="p-8 text-center text-slate-500">Adicione um imóvel primeiro.</div>;
+
+    const LIEN_TYPES = ["Hipoteca", "Penhora", "Arresto", "Usufruto", "Servidão", "Alien. Fiduciária", "Outros"];
+
+    return (
+      <div className="space-y-6">
+        <div className="flex flex-col md:flex-row justify-between md:items-center gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-800">Análise de Ônus e Gravames</h2>
+            <p className="text-sm text-slate-500">Controle de Hipotecas, Penhoras, Arrestos e Usufruto.</p>
+          </div>
+          <button 
+              onClick={() => setShowAddLienModal(true)}
+              className="flex items-center gap-2 px-3 py-2 bg-red-600 text-white rounded-md text-sm hover:bg-red-700 font-medium transition shadow-sm"
+          >
+              <PlusIcon className="w-4 h-4" /> Registrar Ônus
+          </button>
+        </div>
+
+        {/* Property Tabs (Reused) */}
+        <div className="flex overflow-x-auto pb-2 gap-2 border-b border-slate-200">
+          {state.properties.map(prop => (
+              <button
+                  key={prop.id}
+                  onClick={() => setActivePropertyId(prop.id)}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-t-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                      activePropertyId === prop.id 
+                      ? 'bg-white border border-b-0 border-slate-200 text-indigo-600' 
+                      : 'bg-slate-50 text-slate-500 hover:text-slate-700 hover:bg-slate-100'
+                  }`}
+              >
+                  <HomeModernIcon className="w-4 h-4" />
+                  {prop.name || 'Novo Imóvel'}
+              </button>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-1 gap-6 animate-fade-in">
+           {propertyLiens.length === 0 ? (
+             <div className="text-center py-16 bg-white rounded-xl border border-dashed border-slate-300">
+               <ScaleIcon className="w-16 h-16 text-slate-200 mx-auto mb-4" />
+               <h3 className="text-lg font-medium text-slate-900">Nenhum ônus registrado</h3>
+               <p className="text-slate-500 max-w-sm mx-auto mt-2">
+                 Não há registros de hipotecas, penhoras ou outros gravames para este imóvel ({activeProperty?.name}).
+               </p>
+               <button 
+                  onClick={() => setShowAddLienModal(true)}
+                  className="mt-6 text-indigo-600 hover:text-indigo-800 font-semibold"
+                >
+                  Adicionar registro manualmente
+               </button>
+             </div>
+           ) : (
+             propertyLiens.map(lien => (
+               <div key={lien.id} className={`bg-white border rounded-xl p-6 shadow-sm flex flex-col md:flex-row gap-6 relative overflow-hidden ${!lien.isActive ? 'opacity-60 bg-slate-50 border-slate-200' : 'border-slate-200 border-l-4 border-l-red-500'}`}>
+                  
+                  {/* Status Badge Absolute */}
+                  <div className="absolute top-4 right-4 flex gap-2">
+                     <span className={`px-2 py-1 text-xs font-bold uppercase rounded border ${lien.isActive ? 'bg-red-50 text-red-700 border-red-100' : 'bg-slate-200 text-slate-600 border-slate-300'}`}>
+                        {lien.isActive ? 'Ativo' : 'Baixado/Cancelado'}
+                     </span>
+                     <button onClick={() => handleDeleteRequest('lien', lien.id)} className="text-slate-400 hover:text-red-500">
+                        <TrashIcon className="w-5 h-5" />
+                     </button>
+                  </div>
+
+                  {/* Left: Icon & Main Info */}
+                  <div className="flex-1">
+                     <div className="flex items-start gap-4">
+                        <div className={`w-12 h-12 rounded-full flex items-center justify-center flex-shrink-0 ${lien.isActive ? 'bg-red-100 text-red-600' : 'bg-slate-200 text-slate-400'}`}>
+                           <ScaleIcon className="w-6 h-6" />
+                        </div>
+                        <div>
+                           <div className="flex items-center gap-2 mb-1 flex-wrap">
+                             <select
+                                value={lien.type}
+                                onChange={(e) => updateLienDetails(lien.id, { type: e.target.value })}
+                                className="text-lg font-bold text-slate-900 bg-transparent border-0 border-b-2 border-transparent hover:border-slate-200 focus:border-indigo-500 focus:ring-0 py-0 pl-0 pr-8 cursor-pointer transition-colors"
+                             >
+                                {LIEN_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                             </select>
+                             <div className="flex gap-2">
+                               <span className="text-sm font-mono text-slate-500 bg-slate-100 px-2 rounded">{lien.registrationNumber}</span>
+                               {lien.relatedMatricula && (
+                                   <span className="text-sm font-medium text-slate-500 bg-slate-100 px-2 rounded flex items-center gap-1" title="Matrícula Atingida">
+                                       <BuildingLibraryIcon className="w-3 h-3" /> {lien.relatedMatricula}
+                                   </span>
+                               )}
+                             </div>
+                           </div>
+                           <p className="text-sm text-slate-600 font-medium mb-2">Credor: {lien.creditor}</p>
+                           <textarea 
+                              value={lien.description}
+                              onChange={(e) => updateLienDetails(lien.id, { description: e.target.value })}
+                              className="block w-full rounded-md border-0 py-1.5 text-slate-900 shadow-sm ring-1 ring-inset ring-slate-300 placeholder:text-slate-400 focus:ring-2 focus:ring-inset focus:ring-indigo-600 sm:text-sm sm:leading-6 bg-white"
+                              rows={3}
+                              placeholder="Adicionar descrição detalhada..."
+                           />
+                        </div>
+                     </div>
+                  </div>
+
+                  {/* Right: Value & Actions */}
+                  <div className="flex flex-col items-start md:items-end justify-between min-w-[200px] border-t md:border-t-0 md:border-l border-slate-100 pt-4 md:pt-0 md:pl-6 mt-4 md:mt-0">
+                     <div className="text-right w-full">
+                        <p className="text-xs text-slate-500 uppercase font-semibold">Valor da Dívida</p>
+                        <p className={`text-2xl font-bold ${lien.isActive ? 'text-slate-900' : 'text-slate-400 line-through'}`}>
+                          {new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(lien.value)}
+                        </p>
+                     </div>
+                     
+                     <div className="w-full mt-4 flex justify-end">
+                       {lien.isActive ? (
+                         <button 
+                           onClick={() => toggleLienStatus(lien.id, true)}
+                           className="flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors w-full md:w-auto justify-center"
+                         >
+                           <ShieldCheckIcon className="w-4 h-4" /> Dar Baixa / Cancelar
+                         </button>
+                       ) : (
+                         <button 
+                           onClick={() => toggleLienStatus(lien.id, false)}
+                           className="flex items-center gap-2 px-3 py-2 text-red-600 hover:text-red-800 bg-red-50 hover:bg-red-100 rounded-md transition-colors w-full md:w-auto justify-center"
+                         >
+                           <ArrowPathIcon className="w-4 h-4" /> Reativar
+                         </button>
+                       )}
+                     </div>
+                  </div>
+               </div>
+             ))
+           )}
+        </div>
+
+        {/* Modal Add Lien */}
+        {showAddLienModal && (
+          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-6 animate-fade-in">
+                  <div className="flex justify-between items-center mb-4">
+                      <h3 className="text-lg font-bold text-slate-900">Registrar Novo Ônus</h3>
+                      <button onClick={() => setShowAddLienModal(false)} className="text-slate-400 hover:text-slate-600">
+                          <XMarkIcon className="w-6 h-6" />
+                      </button>
+                  </div>
+                  
+                  <div className="p-3 bg-red-50 rounded-md text-xs text-red-700 mb-4 flex items-center gap-2">
+                     <ExclamationTriangleIcon className="w-4 h-4" />
+                     Registrando para: <strong>{activeProperty?.name}</strong>
+                  </div>
+
+                  <div className="space-y-4">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 mb-1">Tipo</label>
+                            <select 
+                                value={newLien.type}
+                                onChange={e => setNewLien({...newLien, type: e.target.value})}
+                                className="w-full rounded-md border-slate-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm border p-2"
+                            >
+                                <option value="Hipoteca">Hipoteca</option>
+                                <option value="Penhora">Penhora</option>
+                                <option value="Arresto">Arresto</option>
+                                <option value="Usufruto">Usufruto</option>
+                                <option value="Servidão">Servidão</option>
+                                <option value="Alien. Fiduciária">Alien. Fiduciária</option>
+                                <option value="Outros">Outros</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 mb-1">Registro (Ex: R.4)</label>
+                            <input 
+                                type="text" 
+                                value={newLien.registrationNumber}
+                                onChange={e => setNewLien({...newLien, registrationNumber: e.target.value})}
+                                className="w-full rounded-md border-slate-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm border p-2"
+                                placeholder="R-01"
+                            />
+                        </div>
+                      </div>
+                      
+                      <div>
+                          <label className="block text-sm font-medium text-slate-700 mb-1">Matrícula Atingida</label>
+                          <input 
+                              type="text" 
+                              value={newLien.relatedMatricula}
+                              onChange={e => setNewLien({...newLien, relatedMatricula: e.target.value})}
+                              className="w-full rounded-md border-slate-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm border p-2"
+                              placeholder="Informe o número da matrícula se específico"
+                          />
+                          <p className="text-[10px] text-slate-400 mt-1">Opcional. Útil se a propriedade possuir múltiplas matrículas.</p>
+                      </div>
+
+                      <div>
+                          <label className="block text-sm font-medium text-slate-700 mb-1">Credor / Favorecido</label>
+                          <input 
+                              type="text" 
+                              value={newLien.creditor}
+                              onChange={e => setNewLien({...newLien, creditor: e.target.value})}
+                              className="w-full rounded-md border-slate-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm border p-2"
+                              placeholder="Nome do banco ou pessoa"
+                          />
+                      </div>
+
+                      <div>
+                          <label className="block text-sm font-medium text-slate-700 mb-1">Valor da Dívida (R$)</label>
+                          <input 
+                              type="number" 
+                              value={newLien.value}
+                              onChange={e => setNewLien({...newLien, value: Number(e.target.value)})}
+                              className="w-full rounded-md border-slate-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm border p-2"
+                              placeholder="0.00"
+                          />
+                      </div>
+
+                      <div>
+                          <label className="block text-sm font-medium text-slate-700 mb-1">Descrição Detalhada</label>
+                          <textarea 
+                              value={newLien.description}
+                              onChange={e => setNewLien({...newLien, description: e.target.value})}
+                              className="w-full rounded-md border-slate-300 shadow-sm focus:border-red-500 focus:ring-red-500 sm:text-sm border p-2"
+                              rows={3}
+                              placeholder="Copie o texto da certidão ou descreva os detalhes..."
+                          />
+                      </div>
+                  </div>
+
+                  <div className="mt-6 flex justify-end gap-3">
+                      <button 
+                          onClick={() => setShowAddItemModal(false)}
+                          className="px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-md"
+                      >
+                          Cancelar
+                      </button>
+                      <button 
+                          onClick={handleAddLien}
+                          disabled={!newLien.registrationNumber || !newLien.creditor}
+                          className="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-md disabled:opacity-50"
+                      >
+                          Registrar
+                      </button>
+                  </div>
+              </div>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const PartiesView = () => {
     const filteredParties = state.parties.filter(party => {
@@ -1144,13 +1908,23 @@ export default function App() {
             'bg-green-50 border-green-100'
           }`}>
             <h3 className="text-lg font-semibold text-slate-800">Resultado da Análise</h3>
-            <span className={`px-3 py-1 rounded-full text-sm font-bold border ${
-              analysisResult.riskLevel === 'Alto' ? 'bg-red-100 text-red-700 border-red-200' :
-              analysisResult.riskLevel === 'Médio' ? 'bg-yellow-100 text-yellow-800 border-yellow-200' :
-              'bg-green-100 text-green-800 border-green-200'
-            }`}>
-              Risco {analysisResult.riskLevel}
-            </span>
+            <div className="flex gap-2">
+                <button
+                    onClick={handleGeneratePDF}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 shadow-sm transition"
+                    title="Baixar Relatório em PDF"
+                >
+                    <DocumentArrowDownIcon className="w-4 h-4 text-slate-500" />
+                    PDF
+                </button>
+                <span className={`px-3 py-1.5 rounded-full text-sm font-bold border ${
+                  analysisResult.riskLevel === 'Alto' ? 'bg-red-100 text-red-700 border-red-200' :
+                  analysisResult.riskLevel === 'Médio' ? 'bg-yellow-100 text-yellow-800 border-yellow-200' :
+                  'bg-green-100 text-green-800 border-green-200'
+                }`}>
+                  Risco {analysisResult.riskLevel}
+                </span>
+            </div>
           </div>
           <div className="p-6 space-y-6">
             <div>
@@ -1215,6 +1989,12 @@ export default function App() {
             <HomeModernIcon className="w-5 h-5" /> Imóvel
           </button>
           <button 
+            onClick={() => setActiveTab('liens')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'liens' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800'}`}
+          >
+            <ScaleIcon className="w-5 h-5" /> Ônus/Gravames
+          </button>
+          <button 
             onClick={() => setActiveTab('parties')}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'parties' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800'}`}
           >
@@ -1229,7 +2009,7 @@ export default function App() {
           </button>
         </nav>
         <div className="p-4 border-t border-slate-800 text-xs text-slate-500">
-          v1.0.0
+          v1.1.0
         </div>
       </div>
 
@@ -1244,12 +2024,14 @@ export default function App() {
               <h1 className="text-2xl md:text-3xl font-bold text-slate-900">
                 {activeTab === 'dashboard' && 'Visão Geral da Auditoria'}
                 {activeTab === 'property' && 'Auditoria do Imóvel'}
+                {activeTab === 'liens' && 'Análise de Ônus e Gravames'}
                 {activeTab === 'parties' && 'Auditoria das Partes'}
                 {activeTab === 'analysis' && 'Análise de Risco com IA'}
               </h1>
               <p className="text-slate-500 mt-1">
                 {activeTab === 'dashboard' && 'Acompanhe o progresso e pendências do processo de Due Diligence.'}
                 {activeTab === 'property' && 'Gestão de certidões, matrículas e regularidade ambiental.'}
+                {activeTab === 'liens' && 'Hipotecas, penhoras, usufruto e outros registros na matrícula.'}
                 {activeTab === 'parties' && 'Análise de vendedores, compradores e cônjuges.'}
                 {activeTab === 'analysis' && 'Gere pareceres automáticos baseados nos dados coletados.'}
               </p>
@@ -1257,6 +2039,7 @@ export default function App() {
 
             {activeTab === 'dashboard' && <DashboardView />}
             {activeTab === 'property' && <PropertyView />}
+            {activeTab === 'liens' && <LiensView />}
             {activeTab === 'parties' && <PartiesView />}
             {activeTab === 'analysis' && <AnalysisView />}
           </div>
@@ -1273,12 +2056,14 @@ export default function App() {
                     </div>
                     <h3 className="text-lg font-bold text-slate-900 mb-2">
                         {deleteTarget.type === 'item' ? 'Excluir Item' : 
-                         deleteTarget.type === 'party' ? 'Excluir Parte' : 'Excluir Imóvel'}
+                         deleteTarget.type === 'party' ? 'Excluir Parte' :
+                         deleteTarget.type === 'lien' ? 'Excluir Ônus' : 'Excluir Imóvel'}
                     </h3>
                     <p className="text-sm text-slate-500 mb-6">
                         Você tem certeza que deseja remover {
                             deleteTarget.type === 'item' ? 'este item da auditoria' :
                             deleteTarget.type === 'party' ? 'esta parte e todos os seus itens' :
+                            deleteTarget.type === 'lien' ? 'este registro de ônus' :
                             'este imóvel e toda a sua checklist'
                         }? Esta ação não pode ser desfeita.
                     </p>

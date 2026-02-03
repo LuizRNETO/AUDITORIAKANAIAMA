@@ -12,12 +12,21 @@ export const analyzeAuditRisks = async (auditData: AuditState): Promise<Analysis
   const ai = new GoogleGenAI({ apiKey });
 
   // Prepare a concise summary of the data for the prompt
-  // Now iterating over multiple properties
-  const propertiesSummary = auditData.properties.map(prop => 
-    `IMÓVEL: ${prop.name} (Matrícula: ${prop.matricula}, Área: ${prop.area}ha, Município: ${prop.municipio})\n` +
+  // Now iterating over multiple properties AND Liens
+  const propertiesSummary = auditData.properties.map(prop => {
+    const propLiens = auditData.liens.filter(l => l.propertyId === prop.id);
+    const activeLiens = propLiens.filter(l => l.isActive);
+    const cancelledLiens = propLiens.filter(l => !l.isActive);
+
+    const liensText = activeLiens.length > 0 
+      ? `\n  ⚠️ ÔNUS ATIVOS: ${activeLiens.map(l => `${l.type} (${l.registrationNumber}) - Credor: ${l.creditor} - R$${l.value}`).join('; ')}`
+      : `\n  Ônus Ativos: Nenhum.`;
+    
+    return `IMÓVEL: ${prop.name} (Matrícula: ${prop.matricula}, Área: ${prop.area}ha, Município: ${prop.municipio})\n` +
     `Checklist do Imóvel:\n` +
-    prop.items.map(i => `  - ${i.name}: ${i.status} (${i.notes || 'Sem observações'})`).join('\n')
-  ).join('\n\n');
+    prop.items.map(i => `  - ${i.name}: ${i.status} (${i.notes || 'Sem observações'})`).join('\n') +
+    liensText;
+  }).join('\n\n');
   
   const partiesSummary = auditData.parties.map(p => 
     `Parte: ${p.name} (${p.role} - ${p.type})\n` + 
@@ -28,7 +37,7 @@ export const analyzeAuditRisks = async (auditData: AuditState): Promise<Analysis
     Atue como um advogado sênior especialista em direito agrário e imobiliário brasileiro (Due Diligence Rural).
     Analise os dados desta auditoria de compra e venda de imóvel rural (pode haver múltiplas matrículas/imóveis envolvidos).
 
-    DADOS DOS IMÓVEIS:
+    DADOS DOS IMÓVEIS E ÔNUS REAIS:
     ${propertiesSummary}
 
     DADOS DAS PARTES:
@@ -39,9 +48,10 @@ export const analyzeAuditRisks = async (auditData: AuditState): Promise<Analysis
 
     INSTRUÇÕES:
     1. Identifique riscos jurídicos (ex: certidões positivas, falta de georreferenciamento, problemas ambientais).
-    2. Status 'pending' gera alerta de atraso. 'issue' é risco alto. 'expired' exige renovação.
-    3. Analise a cadeia dominial e riscos ambientais (IBAMA, CAR) se mencionados.
-    4. Se houver múltiplos imóveis, cite especificamente qual imóvel possui o problema.
+    2. Analise criticamente os ÔNUS (Hipoteca, Penhora, etc). Se houver ônus ativo, classifique como Risco Alto e explique a consequência.
+    3. Status 'pending' gera alerta de atraso. 'issue' é risco alto. 'expired' exige renovação.
+    4. Analise a cadeia dominial e riscos ambientais (IBAMA, CAR) se mencionados.
+    5. Se houver múltiplos imóveis, cite especificamente qual imóvel possui o problema.
   `;
 
   try {
